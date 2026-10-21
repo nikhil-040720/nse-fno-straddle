@@ -6,7 +6,6 @@ import zipfile
 import pandas as pd
 import requests
 
-# Save exclusively to current_month.csv
 REPO_FILE = Path("current_month.csv")
 
 NSE_URL = (
@@ -61,13 +60,40 @@ def monthly_expiry(year, month):
     last_day = calendar.monthrange(year, month)[1]
     d = datetime(year, month, last_day).date()
 
-    while d.weekday() != 1:  # Move to Tuesday
+    while d.weekday() != 1:  # Move backwards to Tuesday
         d -= timedelta(days=1)
 
     while not is_trading_day(d):
         d -= timedelta(days=1)
 
     return pd.Timestamp(d)
+
+
+def get_previous_expiry(year, month):
+    # Previous calendar month's expiry
+    prev_m = 12 if month == 1 else month - 1
+    prev_y = year - 1 if month == 1 else year
+    return monthly_expiry(prev_y, prev_m)
+
+
+def get_cycle_start_cutoff(active_expiry_date):
+    """
+    Finds the previous month's expiry date and rolls backward
+    5 trading days before it to find the start of the tracking cycle.
+    """
+    prev_expiry = get_previous_expiry(active_expiry_date.year, active_expiry_date.month).date()
+    
+    # Step backwards 5 trading sessions before the previous expiry
+    cur = prev_expiry - timedelta(days=1)
+    trading_days_counted = 0
+    while trading_days_counted < 5:
+        if is_trading_day(cur):
+            trading_days_counted += 1
+            if trading_days_counted == 5:
+                break
+        cur -= timedelta(days=1)
+
+    return cur  # This is 5 trading days prior to previous expiry
 
 
 def get_standard_monthly_expiries(trade_date, number=1):
@@ -154,7 +180,6 @@ def calculate_for_symbol(df, symbol, trade_date):
     if futures.empty or options.empty:
         return []
 
-    # Get only the nearest (CURRENT) monthly expiry
     standard_expiries = get_standard_monthly_expiries(trade_date, number=1)
     if not standard_expiries:
         return []
@@ -173,7 +198,6 @@ def calculate_for_symbol(df, symbol, trade_date):
     if not strikes:
         return []
 
-    # Strike nearest to Futures close
     atm = min(strikes, key=lambda x: abs(x - future_close))
 
     ce = opt_exp[(opt_exp["StrkPric"] == atm) & (opt_exp["OptnTp"] == "CE")]
@@ -231,7 +255,7 @@ def process_date(trade_date):
     return results
 
 
-def load_current_month_data(active_month_str):
+def load_cycle_data(active_expiry_str, cycle_start_date_str):
     if not REPO_FILE.exists():
         return pd.DataFrame()
 
@@ -241,17 +265,19 @@ def load_current_month_data(active_month_str):
             return pd.DataFrame()
 
         df["Trade Date"] = df["Trade Date"].astype(str)
-        # Retain only current month and only CURRENT bucket
+        df["Expiry"] = df["Expiry"].astype(str)
+
+        # Retain records from cycle start cutoff onwards for this active expiry
         df = df[
-            df["Trade Date"].str.startswith(active_month_str)
-            & (df["Expiry Bucket"] == "CURRENT")
+            (df["Expiry"] == active_expiry_str) &
+            (df["Trade Date"] >= cycle_start_date_str)
         ]
         return df
     except Exception:
         return pd.DataFrame()
 
 
-def save_current_month_data(df):
+def save_cycle_data(df):
     columns = [
         "Trade Date",
         "Symbol",
@@ -295,10 +321,18 @@ def main():
         print("No data found.")
         return
 
-    active_month_str = actual_trade_date.strftime("%Y-%m")
     new_df = pd.DataFrame(new_rows)
+    active_expiry_dt = pd.to_datetime(new_df["Expiry"].iloc[0]).date()
+    active_expiry_str = active_expiry_dt.strftime("%Y-%m-%d")
 
-    old_df = load_current_month_data(active_month_str)
+    # Calculate 5-trading-day-before-previous-expiry cutoff
+    cycle_start_date = get_cycle_start_cutoff(active_expiry_dt)
+    cycle_start_date_str = cycle_start_date.strftime("%Y-%m-%d")
+
+    print(f"Active Expiry: {active_expiry_str}")
+    print(f"Cycle Start Cutoff (5 trading days before prev expiry): {cycle_start_date_str}")
+
+    old_df = load_cycle_data(active_expiry_str, cycle_start_date_str)
 
     if old_df.empty:
         final_df = new_df
@@ -309,9 +343,9 @@ def main():
             keep="last",
         )
 
-    save_current_month_data(final_df)
+    save_cycle_data(final_df)
     print(f"Saved {len(new_df)} rows for {actual_trade_date}.")
-    print(f"Total rows in {REPO_FILE.name}: {len(final_df)}")
+    print(f"Total rows in tracking window: {len(final_df)}")
 
 
 if __name__ == "__main__":

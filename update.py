@@ -56,6 +56,28 @@ def is_trading_day(d):
     return True
 
 
+def get_weekly_expiry(trade_date):
+    """
+    Finds the active weekly expiry (nearest Tuesday >= trade_date).
+    If Tuesday is a holiday, rolls backward to Monday or previous trading day.
+    """
+    days_until_tuesday = (1 - trade_date.weekday()) % 7
+    tuesday = trade_date + timedelta(days=days_until_tuesday)
+
+    d = tuesday
+    while not is_trading_day(d):
+        d -= timedelta(days=1)
+
+    # If holiday rollback pushed it before trade_date, look to the following week
+    if d < trade_date:
+        next_tuesday = tuesday + timedelta(days=7)
+        d = next_tuesday
+        while not is_trading_day(d):
+            d -= timedelta(days=1)
+
+    return pd.Timestamp(d)
+
+
 def monthly_expiry(year, month):
     last_day = calendar.monthrange(year, month)[1]
     d = datetime(year, month, last_day).date()
@@ -76,10 +98,6 @@ def get_previous_expiry(year, month):
 
 
 def get_cycle_start_cutoff(active_expiry_date):
-    """
-    Finds the previous month's expiry and rolls backward
-    5 trading days before it to find the start of the tracking cycle.
-    """
     prev_expiry = get_previous_expiry(active_expiry_date.year, active_expiry_date.month).date()
     cur = prev_expiry - timedelta(days=1)
     trading_days_counted = 0
@@ -153,9 +171,6 @@ def clean_data(df):
 
 
 def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
-    """
-    Extracts the straddle for the TARGET cycle expiry only (e.g. 2026-10-27).
-    """
     sym = df[df["TckrSymb"] == symbol].copy()
     if sym.empty:
         return []
@@ -169,9 +184,30 @@ def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
     if futures.empty or options.empty:
         return []
 
-    # Filter explicitly for target_expiry_ts
+    # ----------------------------------------------------
+    # Expiry selection:
+    # NIFTY = Current active WEEKLY expiry
+    # Stocks & BANKNIFTY = Current monthly contract (target_expiry_ts)
+    # ----------------------------------------------------
+    if symbol == "NIFTY":
+        opt_expiry = get_weekly_expiry(trade_date)
+    else:
+        opt_expiry = target_expiry_ts
+
+    # For underlying price, pick contract closest to opt_expiry
     fut = futures[futures["XpryDt"] == target_expiry_ts].copy()
-    opt_exp = options[options["XpryDt"] == target_expiry_ts].copy()
+    if fut.empty:
+        fut = futures.sort_values("XpryDt").head(1)
+
+    opt_exp = options[options["XpryDt"] == opt_expiry].copy()
+    if opt_exp.empty:
+        # Fallback to nearest available options expiry >= trade_date if exact match isn't present
+        available = options[options["XpryDt"] >= pd.Timestamp(trade_date)]["XpryDt"].sort_values()
+        if not available.empty:
+            opt_exp = options[options["XpryDt"] == available.iloc[0]].copy()
+            opt_expiry = available.iloc[0]
+        else:
+            return []
 
     if fut.empty or opt_exp.empty:
         return []
@@ -181,7 +217,6 @@ def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
     if not strikes:
         return []
 
-    # ATM Strike nearest to Target Futures Close
     atm = min(strikes, key=lambda x: abs(x - future_close))
     ce = opt_exp[(opt_exp["StrkPric"] == atm) & (opt_exp["OptnTp"] == "CE")]
     pe = opt_exp[(opt_exp["StrkPric"] == atm) & (opt_exp["OptnTp"] == "PE")]
@@ -198,7 +233,7 @@ def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
         "Trade Date": trade_date.strftime("%Y-%m-%d"),
         "Symbol": symbol,
         "Expiry Bucket": "CURRENT",
-        "Expiry": target_expiry_ts.strftime("%Y-%m-%d"),
+        "Expiry": opt_expiry.strftime("%Y-%m-%d"),
         "Futures Close": future_close,
         "ATM Strike": atm,
         "CE Close": ce_close,
@@ -209,7 +244,7 @@ def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
 
 
 def process_date(trade_date, target_expiry_ts):
-    print(f"Downloading NSE data for {trade_date:%Y-%m-%d} (Target Expiry: {target_expiry_ts:%Y-%m-%d})...")
+    print(f"Downloading NSE data for {trade_date:%Y-%m-%d}...")
     df = download_nse(trade_date)
     if df is None:
         print(f"No file available for {trade_date:%Y-%m-%d}")
@@ -249,6 +284,7 @@ def save_cycle_data(df):
         "Straddle %",
     ]
     df = df[columns].copy()
+    # Sort purely alphabetically by Symbol, then Date
     df = df.sort_values(["Trade Date", "Symbol"])
     df.to_csv(REPO_FILE, index=False)
 
@@ -256,7 +292,6 @@ def save_cycle_data(df):
 def main():
     today = datetime.now().date()
 
-    # Identify the target active monthly expiry (e.g., 2026-10-27)
     expiries = get_standard_monthly_expiries(today, number=1)
     if not expiries:
         print("Could not find standard expiry.")
@@ -264,16 +299,10 @@ def main():
 
     target_expiry_ts = expiries[0]
     target_expiry_dt = target_expiry_ts.date()
-    target_expiry_str = target_expiry_dt.strftime("%Y-%m-%d")
 
-    # Start cutoff: exactly 5 trading days prior to previous month expiry (e.g., 2026-09-23)
+    # 5 trading days prior to previous month's expiry
     cycle_start_date = get_cycle_start_cutoff(target_expiry_dt)
-    cycle_start_date_str = cycle_start_date.strftime("%Y-%m-%d")
 
-    print(f"Target Expiry Contract: {target_expiry_str}")
-    print(f"Cycle Start Date: {cycle_start_date_str}")
-
-    # Build calendar list from cycle_start_date up to today
     all_dates_in_cycle = []
     curr = cycle_start_date
     while curr <= today:
@@ -281,7 +310,6 @@ def main():
             all_dates_in_cycle.append(curr)
         curr += timedelta(days=1)
 
-    # Rebuild all cycle rows to ensure pure October expiry data
     all_cycle_rows = []
     for d in all_dates_in_cycle:
         day_rows = process_date(d, target_expiry_ts)
@@ -299,8 +327,7 @@ def main():
     )
 
     save_cycle_data(final_df)
-    print(f"Successfully generated pure {target_expiry_str} data across {final_df['Trade Date'].nunique()} trading dates.")
-    print(f"Total rows: {len(final_df)}")
+    print(f"Total rows saved: {len(final_df)}")
 
 
 if __name__ == "__main__":

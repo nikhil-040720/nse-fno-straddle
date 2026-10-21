@@ -76,6 +76,10 @@ def get_previous_expiry(year, month):
 
 
 def get_cycle_start_cutoff(active_expiry_date):
+    """
+    Finds the previous month's expiry and rolls backward
+    5 trading days before it to find the start of the tracking cycle.
+    """
     prev_expiry = get_previous_expiry(active_expiry_date.year, active_expiry_date.month).date()
     cur = prev_expiry - timedelta(days=1)
     trading_days_counted = 0
@@ -148,7 +152,10 @@ def clean_data(df):
     return df
 
 
-def calculate_for_symbol(df, symbol, trade_date):
+def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
+    """
+    Extracts the straddle for the TARGET cycle expiry only (e.g. 2026-10-27).
+    """
     sym = df[df["TckrSymb"] == symbol].copy()
     if sym.empty:
         return []
@@ -162,13 +169,9 @@ def calculate_for_symbol(df, symbol, trade_date):
     if futures.empty or options.empty:
         return []
 
-    standard_expiries = get_standard_monthly_expiries(trade_date, number=1)
-    if not standard_expiries:
-        return []
-
-    expiry = standard_expiries[0]
-    fut = futures[futures["XpryDt"] == expiry].copy()
-    opt_exp = options[options["XpryDt"] == expiry].copy()
+    # Filter explicitly for target_expiry_ts
+    fut = futures[futures["XpryDt"] == target_expiry_ts].copy()
+    opt_exp = options[options["XpryDt"] == target_expiry_ts].copy()
 
     if fut.empty or opt_exp.empty:
         return []
@@ -178,6 +181,7 @@ def calculate_for_symbol(df, symbol, trade_date):
     if not strikes:
         return []
 
+    # ATM Strike nearest to Target Futures Close
     atm = min(strikes, key=lambda x: abs(x - future_close))
     ce = opt_exp[(opt_exp["StrkPric"] == atm) & (opt_exp["OptnTp"] == "CE")]
     pe = opt_exp[(opt_exp["StrkPric"] == atm) & (opt_exp["OptnTp"] == "PE")]
@@ -194,7 +198,7 @@ def calculate_for_symbol(df, symbol, trade_date):
         "Trade Date": trade_date.strftime("%Y-%m-%d"),
         "Symbol": symbol,
         "Expiry Bucket": "CURRENT",
-        "Expiry": expiry.strftime("%Y-%m-%d"),
+        "Expiry": target_expiry_ts.strftime("%Y-%m-%d"),
         "Futures Close": future_close,
         "ATM Strike": atm,
         "CE Close": ce_close,
@@ -204,8 +208,8 @@ def calculate_for_symbol(df, symbol, trade_date):
     }]
 
 
-def process_date(trade_date):
-    print(f"Downloading NSE data for {trade_date:%Y-%m-%d}...")
+def process_date(trade_date, target_expiry_ts):
+    print(f"Downloading NSE data for {trade_date:%Y-%m-%d} (Target Expiry: {target_expiry_ts:%Y-%m-%d})...")
     df = download_nse(trade_date)
     if df is None:
         print(f"No file available for {trade_date:%Y-%m-%d}")
@@ -223,29 +227,12 @@ def process_date(trade_date):
     for symbol in futures_symbols:
         if symbol in SYMBOLS_TO_EXCLUDE:
             continue
-        results.extend(calculate_for_symbol(df, symbol, trade_date))
+        results.extend(calculate_for_symbol(df, symbol, trade_date, target_expiry_ts))
 
     for index_symbol in ["NIFTY", "BANKNIFTY"]:
-        results.extend(calculate_for_symbol(df, index_symbol, trade_date))
+        results.extend(calculate_for_symbol(df, index_symbol, trade_date, target_expiry_ts))
 
     return results
-
-
-def load_cycle_data(active_expiry_str, cycle_start_date_str):
-    if not REPO_FILE.exists():
-        return pd.DataFrame()
-    try:
-        df = pd.read_csv(REPO_FILE)
-        if df.empty or "Trade Date" not in df.columns:
-            return pd.DataFrame()
-        df["Trade Date"] = df["Trade Date"].astype(str)
-        df["Expiry"] = df["Expiry"].astype(str)
-        return df[
-            (df["Expiry"] == active_expiry_str)
-            & (df["Trade Date"] >= cycle_start_date_str)
-        ]
-    except Exception:
-        return pd.DataFrame()
 
 
 def save_cycle_data(df):
@@ -269,29 +256,24 @@ def save_cycle_data(df):
 def main():
     today = datetime.now().date()
 
-    # Identify the active expiry contract based on today
+    # Identify the target active monthly expiry (e.g., 2026-10-27)
     expiries = get_standard_monthly_expiries(today, number=1)
     if not expiries:
         print("Could not find standard expiry.")
         return
 
-    active_expiry_dt = expiries[0].date()
-    active_expiry_str = active_expiry_dt.strftime("%Y-%m-%d")
+    target_expiry_ts = expiries[0]
+    target_expiry_dt = target_expiry_ts.date()
+    target_expiry_str = target_expiry_dt.strftime("%Y-%m-%d")
 
-    # Start cutoff: exactly 5 trading days prior to previous month expiry
-    cycle_start_date = get_cycle_start_cutoff(active_expiry_dt)
+    # Start cutoff: exactly 5 trading days prior to previous month expiry (e.g., 2026-09-23)
+    cycle_start_date = get_cycle_start_cutoff(target_expiry_dt)
     cycle_start_date_str = cycle_start_date.strftime("%Y-%m-%d")
 
-    print(f"Active Expiry: {active_expiry_str}")
-    print(f"Cycle Start Date (5 days before prev expiry): {cycle_start_date_str}")
+    print(f"Target Expiry Contract: {target_expiry_str}")
+    print(f"Cycle Start Date: {cycle_start_date_str}")
 
-    # Load existing records for this cycle
-    existing_df = load_cycle_data(active_expiry_str, cycle_start_date_str)
-    already_downloaded_dates = set()
-    if not existing_df.empty:
-        already_downloaded_dates = set(existing_df["Trade Date"].unique())
-
-    # Build calendar list from cycle_start_date to today
+    # Build calendar list from cycle_start_date up to today
     all_dates_in_cycle = []
     curr = cycle_start_date
     while curr <= today:
@@ -299,35 +281,26 @@ def main():
             all_dates_in_cycle.append(curr)
         curr += timedelta(days=1)
 
-    new_rows = []
+    # Rebuild all cycle rows to ensure pure October expiry data
+    all_cycle_rows = []
     for d in all_dates_in_cycle:
-        d_str = d.strftime("%Y-%m-%d")
-        if d_str in already_downloaded_dates:
-            continue
-
-        day_rows = process_date(d)
+        day_rows = process_date(d, target_expiry_ts)
         if day_rows:
-            new_rows.extend(day_rows)
+            all_cycle_rows.extend(day_rows)
 
-    if not new_rows and existing_df.empty:
+    if not all_cycle_rows:
         print("No data available.")
         return
 
-    new_df = pd.DataFrame(new_rows)
-    if existing_df.empty:
-        final_df = new_df
-    elif new_df.empty:
-        final_df = existing_df
-    else:
-        final_df = pd.concat([existing_df, new_df], ignore_index=True)
-
+    final_df = pd.DataFrame(all_cycle_rows)
     final_df = final_df.drop_duplicates(
         subset=["Trade Date", "Symbol"],
         keep="last",
     )
 
     save_cycle_data(final_df)
-    print(f"Saved total {len(final_df)} rows across {final_df['Trade Date'].nunique()} trading dates.")
+    print(f"Successfully generated pure {target_expiry_str} data across {final_df['Trade Date'].nunique()} trading dates.")
+    print(f"Total rows: {len(final_df)}")
 
 
 if __name__ == "__main__":

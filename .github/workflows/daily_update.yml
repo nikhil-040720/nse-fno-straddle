@@ -1,0 +1,40 @@
+name: NSE F&O Daily Straddle Update
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 19:00 IST = 13:30 UTC
+    - cron: "30 13 * * 1-5"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install packages
+        run: |
+          pip install pandas requests
+
+      - name: Update NSE F&O data
+        run: |
+          python update.py
+
+      - name: Commit and Push Current Month Data
+        run: |
+          git config user.name "NSE F&O Bot"
+          git config user.email "actions@github.com"
+
+          git add current_month.csv
+          git diff --cached --quiet || git commit -m "Update NSE F&O EOD data [$(date +'%Y-%m')]"
+          git push

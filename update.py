@@ -70,7 +70,7 @@ def monthly_expiry(year, month):
     return pd.Timestamp(d)
 
 
-def get_standard_monthly_expiries(trade_date, number=3):
+def get_standard_monthly_expiries(trade_date, number=1):
     year = trade_date.year
     month = trade_date.month
     expiries = []
@@ -154,55 +154,51 @@ def calculate_for_symbol(df, symbol, trade_date):
     if futures.empty or options.empty:
         return []
 
-    standard_expiries = get_standard_monthly_expiries(trade_date, 3)
-    results = []
+    # Get only the nearest (CURRENT) monthly expiry
+    standard_expiries = get_standard_monthly_expiries(trade_date, number=1)
+    if not standard_expiries:
+        return []
 
-    buckets = [
-        ("CURRENT", standard_expiries[0]),
-        ("NEAR", standard_expiries[1]),
-        ("FAR", standard_expiries[2]),
-    ]
+    expiry = standard_expiries[0]
 
-    for bucket, expiry in buckets:
-        fut = futures[futures["XpryDt"] == expiry].copy()
-        opt_exp = options[options["XpryDt"] == expiry].copy()
+    fut = futures[futures["XpryDt"] == expiry].copy()
+    opt_exp = options[options["XpryDt"] == expiry].copy()
 
-        if fut.empty or opt_exp.empty:
-            continue
+    if fut.empty or opt_exp.empty:
+        return []
 
-        future_close = float(fut.iloc[0]["ClsPric"])
-        strikes = sorted(opt_exp["StrkPric"].dropna().unique())
+    future_close = float(fut.iloc[0]["ClsPric"])
+    strikes = sorted(opt_exp["StrkPric"].dropna().unique())
 
-        if not strikes:
-            continue
+    if not strikes:
+        return []
 
-        atm = min(strikes, key=lambda x: abs(x - future_close))
+    # Strike nearest to Futures close
+    atm = min(strikes, key=lambda x: abs(x - future_close))
 
-        ce = opt_exp[(opt_exp["StrkPric"] == atm) & (opt_exp["OptnTp"] == "CE")]
-        pe = opt_exp[(opt_exp["StrkPric"] == atm) & (opt_exp["OptnTp"] == "PE")]
+    ce = opt_exp[(opt_exp["StrkPric"] == atm) & (opt_exp["OptnTp"] == "CE")]
+    pe = opt_exp[(opt_exp["StrkPric"] == atm) & (opt_exp["OptnTp"] == "PE")]
 
-        if ce.empty or pe.empty:
-            continue
+    if ce.empty or pe.empty:
+        return []
 
-        ce_close = float(ce.iloc[0]["ClsPric"])
-        pe_close = float(pe.iloc[0]["ClsPric"])
-        straddle = ce_close + pe_close
-        straddle_pct = (straddle / future_close * 100) if future_close else None
+    ce_close = float(ce.iloc[0]["ClsPric"])
+    pe_close = float(pe.iloc[0]["ClsPric"])
+    straddle = ce_close + pe_close
+    straddle_pct = (straddle / future_close * 100) if future_close else None
 
-        results.append({
-            "Trade Date": trade_date.strftime("%Y-%m-%d"),
-            "Symbol": symbol,
-            "Expiry Bucket": bucket,
-            "Expiry": expiry.strftime("%Y-%m-%d"),
-            "Futures Close": future_close,
-            "ATM Strike": atm,
-            "CE Close": ce_close,
-            "PE Close": pe_close,
-            "Straddle": straddle,
-            "Straddle %": straddle_pct,
-        })
-
-    return results
+    return [{
+        "Trade Date": trade_date.strftime("%Y-%m-%d"),
+        "Symbol": symbol,
+        "Expiry Bucket": "CURRENT",
+        "Expiry": expiry.strftime("%Y-%m-%d"),
+        "Futures Close": future_close,
+        "ATM Strike": atm,
+        "CE Close": ce_close,
+        "PE Close": pe_close,
+        "Straddle": straddle,
+        "Straddle %": straddle_pct,
+    }]
 
 
 def process_date(trade_date):
@@ -244,9 +240,12 @@ def load_current_month_data(active_month_str):
         if df.empty or "Trade Date" not in df.columns:
             return pd.DataFrame()
 
-        # Only retain entries matching the active month (YYYY-MM)
         df["Trade Date"] = df["Trade Date"].astype(str)
-        df = df[df["Trade Date"].str.startswith(active_month_str)]
+        # Retain only current month and only CURRENT bucket
+        df = df[
+            df["Trade Date"].str.startswith(active_month_str)
+            & (df["Expiry Bucket"] == "CURRENT")
+        ]
         return df
     except Exception:
         return pd.DataFrame()
@@ -267,7 +266,7 @@ def save_current_month_data(df):
     ]
 
     df = df[columns].copy()
-    df = df.sort_values(["Trade Date", "Symbol", "Expiry Bucket"])
+    df = df.sort_values(["Trade Date", "Symbol"])
     df.to_csv(REPO_FILE, index=False)
 
 
@@ -296,11 +295,9 @@ def main():
         print("No data found.")
         return
 
-    # Check active month of the fetched trade date
     active_month_str = actual_trade_date.strftime("%Y-%m")
     new_df = pd.DataFrame(new_rows)
 
-    # Load existing data, keeping ONLY the current month
     old_df = load_current_month_data(active_month_str)
 
     if old_df.empty:
@@ -308,7 +305,7 @@ def main():
     else:
         final_df = pd.concat([old_df, new_df], ignore_index=True)
         final_df = final_df.drop_duplicates(
-            subset=["Trade Date", "Symbol", "Expiry Bucket"],
+            subset=["Trade Date", "Symbol"],
             keep="last",
         )
 

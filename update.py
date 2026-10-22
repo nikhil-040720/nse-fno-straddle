@@ -336,7 +336,6 @@ def main():
             all_dates_in_cycle.append(curr)
         curr += timedelta(days=1)
 
-    # In-memory dictionary that locks the base strike for each symbol
     locked_strikes = {}
     all_cycle_rows = []
 
@@ -350,6 +349,7 @@ def main():
         return
 
     final_df = pd.DataFrame(all_cycle_rows)
+    # Ensure fresh records override any old records
     final_df = final_df.drop_duplicates(
         subset=["Trade Date", "Symbol"],
         keep="last",
@@ -357,7 +357,6 @@ def main():
 
     save_cycle_data(final_df)
     print(f"Successfully processed {len(final_df)} rows across {final_df['Trade Date'].nunique()} trading dates.")
-
-
+    
 if __name__ == "__main__":
     main()

@@ -93,6 +93,10 @@ def get_previous_expiry(year, month):
 
 
 def get_cycle_start_cutoff(active_expiry_date):
+    """
+    Finds the previous month's expiry and rolls backward
+    5 trading days before it to find the start of the tracking cycle.
+    """
     prev_expiry = get_previous_expiry(active_expiry_date.year, active_expiry_date.month).date()
     cur = prev_expiry - timedelta(days=1)
     trading_days_counted = 0
@@ -105,24 +109,45 @@ def get_cycle_start_cutoff(active_expiry_date):
     return cur
 
 
-def get_standard_monthly_expiries(trade_date, number=1):
-    year = trade_date.year
-    month = trade_date.month
+def get_target_cycle_expiry(today):
+    """
+    Determines if we should track current month or roll to NEXT month.
+    If today is within 5 trading days before current monthly expiry (or past it),
+    we roll forward to track the NEXT month's expiry (November).
+    """
     expiries = []
+    year = today.year
+    month = today.month
 
     for i in range(0, 8):
         total_month = month - 1 + i
         y = year + total_month // 12
         m = total_month % 12 + 1
-        expiry = monthly_expiry(y, m)
-
-        if expiry.date() >= trade_date:
-            expiries.append(expiry)
-
-        if len(expiries) >= number:
+        exp = monthly_expiry(y, m)
+        if exp.date() >= today:
+            expiries.append(exp)
+        if len(expiries) >= 2:
             break
 
-    return expiries[:number]
+    curr_exp = expiries[0].date()
+    next_exp = expiries[1] if len(expiries) > 1 else expiries[0]
+
+    # Check cutoff (5 trading days before curr_exp)
+    cur = curr_exp - timedelta(days=1)
+    trading_days_counted = 0
+    while trading_days_counted < 5:
+        if is_trading_day(cur):
+            trading_days_counted += 1
+            if trading_days_counted == 5:
+                break
+        cur -= timedelta(days=1)
+
+    cutoff_for_next_cycle = cur
+
+    # If today has reached 5 trading days before October expiry, switch to November!
+    if today >= cutoff_for_next_cycle:
+        return next_exp  # November Expiry
+    return expiries[0]   # October Expiry
 
 
 def download_nse(trade_date):
@@ -159,7 +184,6 @@ def clean_data(df):
     else:
         df["OptionPrice"] = 0.0
 
-    # Fallback if 0 or NaN
     if "SttlmPric" in df.columns:
         df["OptionPrice"] = df["OptionPrice"].replace(0, pd.NA).fillna(pd.to_numeric(df["SttlmPric"], errors="coerce"))
 
@@ -183,7 +207,6 @@ def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
     if futures.empty or options.empty:
         return []
 
-    # NIFTY = Weekly Expiry; All other stocks = Target Monthly Expiry
     if symbol == "NIFTY":
         opt_expiry = get_weekly_expiry(trade_date)
     else:
@@ -210,7 +233,6 @@ def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
     if not strikes:
         return []
 
-    # Pick the ATM strike nearest to the daily futures close
     atm_strike = min(strikes, key=lambda x: abs(x - future_close))
 
     ce = opt_exp[(opt_exp["StrkPric"] == atm_strike) & (opt_exp["OptnTp"] == "CE")]
@@ -239,7 +261,7 @@ def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
 
 
 def process_date(trade_date, target_expiry_ts):
-    print(f"Downloading NSE data for {trade_date:%Y-%m-%d}...")
+    print(f"Downloading NSE data for {trade_date:%Y-%m-%d} (Expiry: {target_expiry_ts:%Y-%m-%d})...")
     df = download_nse(trade_date)
     if df is None:
         print(f"No file available for {trade_date:%Y-%m-%d}")
@@ -286,15 +308,15 @@ def save_cycle_data(df):
 def main():
     today = datetime.now().date()
 
-    expiries = get_standard_monthly_expiries(today, number=1)
-    if not expiries:
-        print("Could not find standard expiry.")
-        return
-
-    target_expiry_ts = expiries[0]
+    # Automatically switches to November contract once within 5 trading days of Oct expiry
+    target_expiry_ts = get_target_cycle_expiry(today)
     target_expiry_dt = target_expiry_ts.date()
 
+    # Start date = 5 trading days before previous expiry (October 27)
     cycle_start_date = get_cycle_start_cutoff(target_expiry_dt)
+
+    print(f"Target Active Expiry: {target_expiry_dt}")
+    print(f"Cycle Start Date: {cycle_start_date}")
 
     all_dates_in_cycle = []
     curr = cycle_start_date
@@ -320,7 +342,7 @@ def main():
     )
 
     save_cycle_data(final_df)
-    print(f"Successfully processed {len(final_df)} rows across {final_df['Trade Date'].nunique()} trading dates.")
+    print(f"Successfully processed {len(final_df)} rows for {target_expiry_dt} cycle across {final_df['Trade Date'].nunique()} trading dates.")
 
 
 if __name__ == "__main__":

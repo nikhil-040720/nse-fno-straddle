@@ -7,6 +7,7 @@ import pandas as pd
 import requests
 
 REPO_FILE = Path("current_month.csv")
+GAP_FILE = Path("strike_gaps.csv")
 
 NSE_URL = (
     "https://nsearchives.nseindia.com/content/fo/"
@@ -57,10 +58,6 @@ def is_trading_day(d):
 
 
 def get_weekly_expiry(trade_date):
-    """
-    Finds the active weekly expiry (nearest Tuesday >= trade_date).
-    If Tuesday is a holiday, rolls backward to Monday or previous trading day.
-    """
     days_until_tuesday = (1 - trade_date.weekday()) % 7
     tuesday = trade_date + timedelta(days=days_until_tuesday)
 
@@ -68,7 +65,6 @@ def get_weekly_expiry(trade_date):
     while not is_trading_day(d):
         d -= timedelta(days=1)
 
-    # If holiday rollback pushed it before trade_date, look to the following week
     if d < trade_date:
         next_tuesday = tuesday + timedelta(days=7)
         d = next_tuesday
@@ -130,6 +126,20 @@ def get_standard_monthly_expiries(trade_date, number=1):
     return expiries[:number]
 
 
+def load_strike_gaps():
+    """Loads symbol strike gaps from strike_gaps.csv."""
+    if not GAP_FILE.exists():
+        return {}
+    try:
+        df = pd.read_csv(GAP_FILE)
+        df.columns = [str(c).strip().title() for c in df.columns]
+        if "Symbol" in df.columns and "Gap" in df.columns:
+            return dict(zip(df["Symbol"].astype(str).str.strip().str.upper(), pd.to_numeric(df["Gap"], errors="coerce")))
+    except Exception as e:
+        print(f"Error loading strike_gaps.csv: {e}")
+    return {}
+
+
 def download_nse(trade_date):
     date_text = trade_date.strftime("%Y%m%d")
     url = NSE_URL.format(date=date_text)
@@ -156,10 +166,15 @@ def download_nse(trade_date):
 
 def clean_data(df):
     df.columns = [str(c).strip() for c in df.columns]
-    required = ["FinInstrmTp", "TckrSymb", "XpryDt", "StrkPric", "OptnTp", "ClsPric"]
-    for col in required:
-        if col not in df.columns:
-            raise Exception(f"Required NSE column missing: {col}")
+
+    # SttlmPric is SETTLE_PR in Bhavcopy
+    if "SttlmPric" in df.columns:
+        df["SettlePrice"] = pd.to_numeric(df["SttlmPric"], errors="coerce")
+    else:
+        df["SettlePrice"] = pd.to_numeric(df["ClsPric"], errors="coerce")
+
+    # If settlement price is null/0, fallback to ClsPric
+    df["SettlePrice"] = df["SettlePrice"].fillna(pd.to_numeric(df["ClsPric"], errors="coerce"))
 
     df["TckrSymb"] = df["TckrSymb"].astype(str).str.strip().str.upper()
     df["FinInstrmTp"] = df["FinInstrmTp"].astype(str).str.strip().str.upper()
@@ -170,7 +185,7 @@ def clean_data(df):
     return df
 
 
-def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
+def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts, locked_strikes, strike_gaps):
     sym = df[df["TckrSymb"] == symbol].copy()
     if sym.empty:
         return []
@@ -178,30 +193,21 @@ def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
     futures = sym[sym["FinInstrmTp"].isin(["IDF", "STF"])].copy()
     options = sym[sym["FinInstrmTp"].isin(["IDO", "STO"])].copy()
 
-    futures = futures[futures["ClsPric"].notna()]
-    options = options[options["ClsPric"].notna()]
-
     if futures.empty or options.empty:
         return []
 
-    # ----------------------------------------------------
-    # Expiry selection:
-    # NIFTY = Current active WEEKLY expiry
-    # Stocks & BANKNIFTY = Current monthly contract (target_expiry_ts)
-    # ----------------------------------------------------
+    # NIFTY = Weekly Expiry; All other stocks = Target Monthly Expiry
     if symbol == "NIFTY":
         opt_expiry = get_weekly_expiry(trade_date)
     else:
         opt_expiry = target_expiry_ts
 
-    # For underlying price, pick contract closest to opt_expiry
     fut = futures[futures["XpryDt"] == target_expiry_ts].copy()
     if fut.empty:
         fut = futures.sort_values("XpryDt").head(1)
 
     opt_exp = options[options["XpryDt"] == opt_expiry].copy()
     if opt_exp.empty:
-        # Fallback to nearest available options expiry >= trade_date if exact match isn't present
         available = options[options["XpryDt"] >= pd.Timestamp(trade_date)]["XpryDt"].sort_values()
         if not available.empty:
             opt_exp = options[options["XpryDt"] == available.iloc[0]].copy()
@@ -212,21 +218,40 @@ def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
     if fut.empty or opt_exp.empty:
         return []
 
-    future_close = float(fut.iloc[0]["ClsPric"])
-    strikes = sorted(opt_exp["StrkPric"].dropna().unique())
-    if not strikes:
+    future_close = float(fut.iloc[0]["SettlePrice"] if pd.notna(fut.iloc[0]["SettlePrice"]) else fut.iloc[0]["ClsPric"])
+    available_strikes = sorted(opt_exp["StrkPric"].dropna().unique())
+    if not available_strikes:
         return []
 
-    atm = min(strikes, key=lambda x: abs(x - future_close))
-    ce = opt_exp[(opt_exp["StrkPric"] == atm) & (opt_exp["OptnTp"] == "CE")]
-    pe = opt_exp[(opt_exp["StrkPric"] == atm) & (opt_exp["OptnTp"] == "PE")]
+    # -----------------------------------------------------------------
+    # STRIKE SELECTION LOGIC:
+    # 1. Use the locked base strike for this cycle if already established
+    # 2. Else compute ATM using round(future_close / gap) * gap
+    # -----------------------------------------------------------------
+    if symbol in locked_strikes and symbol != "NIFTY":
+        chosen_strike = locked_strikes[symbol]
+    else:
+        gap = strike_gaps.get(symbol, None)
+        if gap and pd.notna(gap) and gap > 0:
+            computed_strike = round(future_close / gap) * gap
+            # Match nearest available strike in contract in case of decimals
+            chosen_strike = min(available_strikes, key=lambda x: abs(x - computed_strike))
+        else:
+            chosen_strike = min(available_strikes, key=lambda x: abs(x - future_close))
+
+        # Lock this strike for the remainder of this monthly cycle
+        if symbol != "NIFTY":
+            locked_strikes[symbol] = chosen_strike
+
+    ce = opt_exp[(opt_exp["StrkPric"] == chosen_strike) & (opt_exp["OptnTp"] == "CE")]
+    pe = opt_exp[(opt_exp["StrkPric"] == chosen_strike) & (opt_exp["OptnTp"] == "PE")]
 
     if ce.empty or pe.empty:
         return []
 
-    ce_close = float(ce.iloc[0]["ClsPric"])
-    pe_close = float(pe.iloc[0]["ClsPric"])
-    straddle = ce_close + pe_close
+    ce_settle = float(ce.iloc[0]["SettlePrice"])
+    pe_settle = float(pe.iloc[0]["SettlePrice"])
+    straddle = ce_settle + pe_settle
     straddle_pct = (straddle / future_close * 100) if future_close else None
 
     return [{
@@ -235,15 +260,15 @@ def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
         "Expiry Bucket": "CURRENT",
         "Expiry": opt_expiry.strftime("%Y-%m-%d"),
         "Futures Close": future_close,
-        "ATM Strike": atm,
-        "CE Close": ce_close,
-        "PE Close": pe_close,
+        "ATM Strike": chosen_strike,
+        "CE Close": ce_settle,
+        "PE Close": pe_settle,
         "Straddle": straddle,
         "Straddle %": straddle_pct,
     }]
 
 
-def process_date(trade_date, target_expiry_ts):
+def process_date(trade_date, target_expiry_ts, locked_strikes, strike_gaps):
     print(f"Downloading NSE data for {trade_date:%Y-%m-%d}...")
     df = download_nse(trade_date)
     if df is None:
@@ -262,10 +287,10 @@ def process_date(trade_date, target_expiry_ts):
     for symbol in futures_symbols:
         if symbol in SYMBOLS_TO_EXCLUDE:
             continue
-        results.extend(calculate_for_symbol(df, symbol, trade_date, target_expiry_ts))
+        results.extend(calculate_for_symbol(df, symbol, trade_date, target_expiry_ts, locked_strikes, strike_gaps))
 
     for index_symbol in ["NIFTY", "BANKNIFTY"]:
-        results.extend(calculate_for_symbol(df, index_symbol, trade_date, target_expiry_ts))
+        results.extend(calculate_for_symbol(df, index_symbol, trade_date, target_expiry_ts, locked_strikes, strike_gaps))
 
     return results
 
@@ -284,13 +309,14 @@ def save_cycle_data(df):
         "Straddle %",
     ]
     df = df[columns].copy()
-    # Sort purely alphabetically by Symbol, then Date
     df = df.sort_values(["Trade Date", "Symbol"])
     df.to_csv(REPO_FILE, index=False)
 
 
 def main():
     today = datetime.now().date()
+    strike_gaps = load_strike_gaps()
+    print(f"Loaded {len(strike_gaps)} strike gaps from {GAP_FILE.name}")
 
     expiries = get_standard_monthly_expiries(today, number=1)
     if not expiries:
@@ -300,9 +326,9 @@ def main():
     target_expiry_ts = expiries[0]
     target_expiry_dt = target_expiry_ts.date()
 
-    # 5 trading days prior to previous month's expiry
     cycle_start_date = get_cycle_start_cutoff(target_expiry_dt)
 
+    # Sort days chronologically from base day (23 Sep) to today
     all_dates_in_cycle = []
     curr = cycle_start_date
     while curr <= today:
@@ -310,9 +336,12 @@ def main():
             all_dates_in_cycle.append(curr)
         curr += timedelta(days=1)
 
+    # In-memory dictionary that locks the base strike for each symbol
+    locked_strikes = {}
     all_cycle_rows = []
+
     for d in all_dates_in_cycle:
-        day_rows = process_date(d, target_expiry_ts)
+        day_rows = process_date(d, target_expiry_ts, locked_strikes, strike_gaps)
         if day_rows:
             all_cycle_rows.extend(day_rows)
 
@@ -327,7 +356,7 @@ def main():
     )
 
     save_cycle_data(final_df)
-    print(f"Total rows saved: {len(final_df)}")
+    print(f"Successfully processed {len(final_df)} rows across {final_df['Trade Date'].nunique()} trading dates.")
 
 
 if __name__ == "__main__":

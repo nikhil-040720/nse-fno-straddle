@@ -150,22 +150,22 @@ def download_nse(trade_date):
 def clean_data(df):
     df.columns = [str(c).strip() for c in df.columns]
 
-    if "ClsPric" in df.columns:
-        df["OptionPrice"] = pd.to_numeric(df["ClsPric"], errors="coerce")
-    elif "SttlmPric" in df.columns:
-        df["OptionPrice"] = pd.to_numeric(df["SttlmPric"], errors="coerce")
-    else:
-        df["OptionPrice"] = 0.0
+    # Explicitly prioritize SttlmPric (SETTLE_PR), fallback to ClsPric
+    settle = pd.to_numeric(df["SttlmPric"], errors="coerce") if "SttlmPric" in df.columns else pd.Series(index=df.index, dtype=float)
+    close = pd.to_numeric(df["ClsPric"], errors="coerce") if "ClsPric" in df.columns else pd.Series(index=df.index, dtype=float)
 
-    if "SttlmPric" in df.columns:
-        df["OptionPrice"] = df["OptionPrice"].replace(0, pd.NA).fillna(pd.to_numeric(df["SttlmPric"], errors="coerce"))
+    # Replace 0 or NaN with the fallback value
+    settle = settle.replace(0, pd.NA)
+    close = close.replace(0, pd.NA)
+
+    # Primary price is Settlement; fallback is Close
+    df["CleanPrice"] = settle.combine_first(close).fillna(0.0)
 
     df["TckrSymb"] = df["TckrSymb"].astype(str).str.strip().str.upper()
     df["FinInstrmTp"] = df["FinInstrmTp"].astype(str).str.strip().str.upper()
     df["OptnTp"] = df["OptnTp"].astype(str).str.strip().str.upper()
     df["XpryDt"] = pd.to_datetime(df["XpryDt"], errors="coerce")
     df["StrkPric"] = pd.to_numeric(df["StrkPric"], errors="coerce")
-    df["ClsPric"] = pd.to_numeric(df["ClsPric"], errors="coerce")
     return df
 
 
@@ -185,6 +185,7 @@ def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
     else:
         opt_expiry = target_expiry_ts
 
+    # Futures contract matching target expiry
     fut = futures[futures["XpryDt"] == target_expiry_ts].copy()
     if fut.empty:
         fut = futures.sort_values("XpryDt").head(1)
@@ -201,12 +202,17 @@ def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
     if fut.empty or opt_exp.empty:
         return []
 
-    future_close = float(fut.iloc[0]["ClsPric"])
+    # Use CleanPrice (Settlement Price) for the Futures reference
+    future_ref_price = float(fut.iloc[0]["CleanPrice"])
+    if future_ref_price == 0.0:
+        return []
+
     strikes = sorted(opt_exp["StrkPric"].dropna().unique())
     if not strikes:
         return []
 
-    atm_strike = min(strikes, key=lambda x: abs(x - future_close))
+    # Strike closest to settlement future price
+    atm_strike = min(strikes, key=lambda x: abs(x - future_ref_price))
 
     ce = opt_exp[(opt_exp["StrkPric"] == atm_strike) & (opt_exp["OptnTp"] == "CE")]
     pe = opt_exp[(opt_exp["StrkPric"] == atm_strike) & (opt_exp["OptnTp"] == "PE")]
@@ -214,17 +220,18 @@ def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
     if ce.empty or pe.empty:
         return []
 
-    ce_price = float(ce.iloc[0]["OptionPrice"])
-    pe_price = float(pe.iloc[0]["OptionPrice"])
+    # Use CleanPrice (Settlement Price) for both Call and Put
+    ce_price = float(ce.iloc[0]["CleanPrice"])
+    pe_price = float(pe.iloc[0]["CleanPrice"])
     straddle = ce_price + pe_price
-    straddle_pct = (straddle / future_close * 100) if future_close else None
+    straddle_pct = (straddle / future_ref_price * 100) if future_ref_price else None
 
     return [{
         "Trade Date": trade_date.strftime("%Y-%m-%d"),
         "Symbol": symbol,
         "Expiry Bucket": "CURRENT",
         "Expiry": opt_expiry.strftime("%Y-%m-%d"),
-        "Futures Close": future_close,
+        "Futures Close": future_ref_price,
         "ATM Strike": atm_strike,
         "CE Close": ce_price,
         "PE Close": pe_price,
@@ -249,7 +256,6 @@ def process_date(trade_date, target_expiries):
     )
 
     results = []
-    # Loop over all target expiries (both current and rollover contract if in overlap)
     for target_expiry_ts in target_expiries:
         for symbol in futures_symbols:
             if symbol in SYMBOLS_TO_EXCLUDE:
@@ -311,7 +317,6 @@ def main():
         print(f"Next Monthly Expiry: {next_exp_dt}")
     print(f"Rollover Start Date (5 days before current expiry): {overlap_start_date}")
 
-    # Build chronological dates from earliest_cycle_start to today
     all_dates = []
     curr = earliest_cycle_start
     while curr <= today:
@@ -321,7 +326,6 @@ def main():
 
     all_rows = []
     for d in all_dates:
-        # Determine which expiries to fetch on this trade date:
         target_expiries_for_date = []
 
         # 1. Fetch current monthly contract if trade date <= current expiry
@@ -342,7 +346,6 @@ def main():
         return
 
     final_df = pd.DataFrame(all_rows)
-    # Deduplicate matching date, symbol, and expiry contract
     final_df = final_df.drop_duplicates(
         subset=["Trade Date", "Symbol", "Expiry"],
         keep="last",

@@ -146,9 +146,15 @@ def download_nse(trade_date):
         with z.open(csv_files[0]) as f:
             return pd.read_csv(f, low_memory=False)
 
-
+SYMBOL_RENAMES = {
+    "ICICIPRULI": "ICICILIFE",
+}
 def clean_data(df):
     df.columns = [str(c).strip() for c in df.columns]
+    
+    # Normalize ticker symbols & apply official NSE ticker migration
+    df["TckrSymb"] = df["TckrSymb"].astype(str).str.strip().str.upper()
+    df["TckrSymb"] = df["TckrSymb"].replace(SYMBOL_RENAMES)
 
     # Explicitly prioritize SttlmPric (SETTLE_PR), fallback to ClsPric
     settle = pd.to_numeric(df["SttlmPric"], errors="coerce") if "SttlmPric" in df.columns else pd.Series(index=df.index, dtype=float)
@@ -161,7 +167,7 @@ def clean_data(df):
     # Primary price is Settlement; fallback is Close
     df["CleanPrice"] = settle.combine_first(close).fillna(0.0)
 
-    df["TckrSymb"] = df["TckrSymb"].astype(str).str.strip().str.upper()
+    
     df["FinInstrmTp"] = df["FinInstrmTp"].astype(str).str.strip().str.upper()
     df["OptnTp"] = df["OptnTp"].astype(str).str.strip().str.upper()
     df["XpryDt"] = pd.to_datetime(df["XpryDt"], errors="coerce")

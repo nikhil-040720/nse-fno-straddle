@@ -25,9 +25,11 @@
 
 ```mermaid
 flowchart LR
-    A[NSE Bhavcopy ZIP] -->|Fetch EOD Archives| B(update.py Engine)
-    B -->|Calculate ATM Straddles| C[current_month.csv]
-    C -->|Commit & Push| D[GitHub Repository]
-    D -->|Daily Trigger / 8:30 PM IST| E[Google Apps Script]
-    E -->|Dual-Routing Engine| F[STD Sheet Dashboard]
-    F -->|Raw
+    A["NSE Bhavcopy ZIP"] -->|Fetch EOD Archives| B("update.py Engine")
+    B -->|Calculate ATM Straddles| C["current_month.csv"]
+    C -->|Commit & Push| D["GitHub Repository"]
+    D -->|Daily Trigger / 8:30 PM IST| E["Google Apps Script"]
+    E -->|Dual-Routing Engine| F["STD Sheet Dashboard"]
+    F -->|Raw Records| G[("Data Hub (data)")]
+    F -->|Expiring Cycle| H["OCT 26 Archive Tab"]
+    F -->|Upcoming Cycle| I["STRADDLE Live Tab"]

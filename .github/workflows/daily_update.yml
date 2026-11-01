@@ -3,8 +3,8 @@ name: NSE F&O Daily Straddle Update
 on:
   workflow_dispatch:
   schedule:
-    # 20:30 IST (8:30 PM) = 15:00 UTC (Mon - Fri)
-    - cron: "0 15 * * 1-5"
+    # 20:28 IST (8:28 PM) = 14:58 UTC (Mon - Fri)
+    - cron: "58 14 * * 1-5"
 
 permissions:
   contents: write

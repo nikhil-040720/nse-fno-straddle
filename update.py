@@ -220,7 +220,10 @@ def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
     if future_ref_price == 0.0:
         return []
 
-    strikes = sorted(opt_exp["StrkPric"].dropna().unique())
+    #strikes = sorted(opt_exp["StrkPric"].dropna().unique())
+    ce_strikes = set(opt_exp.loc[(opt_exp["OptnTp"] == "CE") & (opt_exp["CleanPrice"] > 0), "StrkPric"].dropna())
+    pe_strikes = set(opt_exp.loc[(opt_exp["OptnTp"] == "PE") & (opt_exp["CleanPrice"] > 0), "StrkPric"].dropna())
+    strikes = sorted(ce_strikes & pe_strikes)
     if not strikes:
         return []
 

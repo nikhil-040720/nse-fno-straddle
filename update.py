@@ -64,7 +64,8 @@ def get_weekly_expiry(trade_date):
     while not is_trading_day(d):
         d -= timedelta(days=1)
 
-    if d < trade_date:
+    # On weekly expiry day (d == trade_date), immediately roll over to next week's contract
+    if d <= trade_date:
         next_tuesday = tuesday + timedelta(days=7)
         d = next_tuesday
         while not is_trading_day(d):
@@ -186,24 +187,30 @@ def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
     if futures.empty or options.empty:
         return []
 
-    if symbol == "NIFTY":
-        opt_expiry = get_weekly_expiry(trade_date)
-    else:
-        opt_expiry = target_expiry_ts
-
-    # Futures contract matching target expiry
+    # Futures contract matching target monthly expiry
     fut = futures[futures["XpryDt"] == target_expiry_ts].copy()
     if fut.empty:
         fut = futures.sort_values("XpryDt").head(1)
 
-    opt_exp = options[options["XpryDt"] == opt_expiry].copy()
-    if opt_exp.empty:
-        available = options[options["XpryDt"] >= pd.Timestamp(trade_date)]["XpryDt"].sort_values()
+    if symbol == "NIFTY":
+        # Strictly pick the nearest weekly option expiry AFTER trade_date (> instead of >=)
+        # This guarantees we never pick the expiring contract on NIFTY expiry day
+        available = options[options["XpryDt"] > pd.Timestamp(trade_date)]["XpryDt"].sort_values()
         if not available.empty:
-            opt_exp = options[options["XpryDt"] == available.iloc[0]].copy()
             opt_expiry = available.iloc[0]
+            opt_exp = options[options["XpryDt"] == opt_expiry].copy()
         else:
             return []
+    else:
+        opt_expiry = target_expiry_ts
+        opt_exp = options[options["XpryDt"] == opt_expiry].copy()
+        if opt_exp.empty:
+            available = options[options["XpryDt"] >= pd.Timestamp(trade_date)]["XpryDt"].sort_values()
+            if not available.empty:
+                opt_expiry = available.iloc[0]
+                opt_exp = options[options["XpryDt"] == opt_expiry].copy()
+            else:
+                return []
 
     if fut.empty or opt_exp.empty:
         return []

@@ -193,6 +193,7 @@ def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
         fut = futures.sort_values("XpryDt").head(1)
 
     if symbol == "NIFTY":
+        # Strictly pick the nearest weekly option expiry AFTER trade_date (> instead of >=)
         available = options[options["XpryDt"] > pd.Timestamp(trade_date)]["XpryDt"].sort_values()
         if not available.empty:
             opt_expiry = available.iloc[0]
@@ -213,6 +214,7 @@ def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
     if fut.empty or opt_exp.empty:
         return []
 
+    # Use CleanPrice (Settlement Price) for the Futures reference
     future_ref_price = float(fut.iloc[0]["CleanPrice"])
     if future_ref_price == 0.0:
         return []
@@ -227,24 +229,35 @@ def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
     # NIFTY SYNTHETIC FUTURE ATM SELECTION LOGIC
     # ==========================================
     if symbol == "NIFTY":
-        # Step 1: Find the initial rough ATM strike using the reference futures/underlying price
+        # Step 1: Find rough ATM from futures/underlying reference
         rough_atm = min(strikes, key=lambda x: abs(x - future_ref_price))
         
-        # Step 2: Get CE and PE at that rough ATM strike
-        ce_row = opt_exp[(opt_exp["StrkPric"] == rough_atm) & (opt_exp["OptnTp"] == "CE")]
-        pe_row = opt_exp[(opt_exp["StrkPric"] == rough_atm) & (opt_exp["OptnTp"] == "PE")]
+        # Step 2 & 3: Test candidate strikes around rough ATM to find the one matching Synthetic Future (Strike + CE - PE)
+        best_strike = rough_atm
+        min_diff = float('inf')
         
-        if not ce_row.empty and not pe_row.empty:
-            ce_p = float(ce_row.iloc[0]["CleanPrice"])
-            pe_p = float(pe_row.iloc[0]["CleanPrice"])
+        candidate_strikes = [s for s in strikes if abs(s - rough_atm) <= 100]
+        if not candidate_strikes:
+            candidate_strikes = [rough_atm]
             
-            # Step 3: Calculate Synthetic Future Price = Strike + CE - PE
-            synthetic_future = rough_atm + ce_p - pe_p
+        for s in candidate_strikes:
+            ce_row = opt_exp[(opt_exp["StrkPric"] == s) & (opt_exp["OptnTp"] == "CE")]
+            pe_row = opt_exp[(opt_exp["StrkPric"] == s) & (opt_exp["OptnTp"] == "PE")]
             
-            # Step 4: Find the true ATM strike closest to the Synthetic Future price
-            atm_strike = min(strikes, key=lambda x: abs(x - synthetic_future))
-        else:
-            atm_strike = rough_atm
+            if not ce_row.empty and not pe_row.empty:
+                ce_p = float(ce_row.iloc[0]["CleanPrice"])
+                pe_p = float(pe_row.iloc[0]["CleanPrice"])
+                
+                # Synthetic future price = Strike + CE - PE
+                synth_fut = s + ce_p - pe_p
+                
+                # Find strike closest to its own synthetic future
+                diff = abs(s - synth_fut)
+                if diff < min_diff:
+                    min_diff = diff
+                    best_strike = s
+                    
+        atm_strike = best_strike
     else:
         # Standard logic for stocks and BANKNIFTY
         atm_strike = min(strikes, key=lambda x: abs(x - future_ref_price))
@@ -273,6 +286,7 @@ def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
         "Straddle": straddle,
         "Straddle %": straddle_pct,
     }]
+
 
 def process_date(trade_date, target_expiries):
     print(f"Downloading NSE data for {trade_date:%Y-%m-%d}...")

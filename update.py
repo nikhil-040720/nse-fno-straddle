@@ -227,7 +227,7 @@ def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
     # NIFTY SYNTHETIC FUTURE ATM SELECTION LOGIC
     # ==========================================
     if symbol == "NIFTY":
-        # Step 1: Find initial ATM strike using Futures reference to evaluate nearby options
+        # Step 1: Find the initial rough ATM strike using the reference futures/underlying price
         rough_atm = min(strikes, key=lambda x: abs(x - future_ref_price))
         
         # Step 2: Get CE and PE at that rough ATM strike
@@ -241,7 +241,7 @@ def calculate_for_symbol(df, symbol, trade_date, target_expiry_ts):
             # Step 3: Calculate Synthetic Future Price = Strike + CE - PE
             synthetic_future = rough_atm + ce_p - pe_p
             
-            # Step 4: Find true ATM strike based on Synthetic Future price
+            # Step 4: Find the true ATM strike closest to the Synthetic Future price
             atm_strike = min(strikes, key=lambda x: abs(x - synthetic_future))
         else:
             atm_strike = rough_atm
